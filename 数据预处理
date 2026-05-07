@@ -1,0 +1,123 @@
+""
+5/2 数据预处理就基本完成。
+首先异常值缺失值进行了初步筛选
+异常值采用箱线图 Q1-2.0 IQR ~ Q3+2.0 IQR进行了初筛
+缺失值采取
+少量缺失（1-2个）：用局部信息（插值）
+较多缺失（3-5个）：用全局信息（均值）
+太多缺失（>=6个）：直接扔掉这个窗口
+然后采取6-1  的时间窗口
+总共六百个窗口损失了50% 剩余312个时间窗口
+""
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from collections import Counter
+
+features = pd.read_excel("C:\\Users\\张宇轩\\Desktop\\Programs\\Code\\process.xlsx",sheet_name="Sheet1",header=0,index_col=0,names=None,dtype=None)
+# print('特征数', len(features.columns)) 
+labels = pd.read_excel("C:\\Users\\张宇轩\\Desktop\\Programs\\Code\\FeO_Final.xlsx",sheet_name="Sheet1",header=0,index_col=0,names=None,dtype=None)
+
+features.index = features.index.round('h')
+labels.index = labels.index.round('h')
+
+#零值转换成NaN值
+features.replace(0,np.nan,inplace= True)
+labels.replace(0,np.nan,inplace= True)
+
+# use_features = feautres.columns.tolist() # 获取特征列的列表
+def replace_outliers_with_nan(df, features):
+      #将指定列中的异常值（基于IQR）替换为NaN，直接修改原DataFrame。
+
+      for col in features:
+          Q1 = np.percentile(df[col].dropna(), 25)
+          Q3 = np.percentile(df[col].dropna(), 75)
+          IQR = Q3 - Q1
+          lower = Q1 - 2.0 * IQR
+          upper = Q3 + 2.0 * IQR
+
+          # 将异常值替换为NaN
+          df[col] = df[col].where((df[col] >= lower) & (df[col] <= upper), np.nan)
+            
+      return df
+
+features = replace_outliers_with_nan(features, features.columns.tolist())
+labels = replace_outliers_with_nan(labels, labels.columns.tolist())
+
+print(labels.isna().sum()) # 输出每列缺失值数量
+# 1. 预计算全局均值，用于 3 个缺失值的情况
+global_means = features.mean()
+
+X_list = []       # 收集通过的窗口数据
+y_list = []       # 对应的FeO值
+features_interpolated = features.interpolate(method='linear').bfill().ffill()
+features_ffill = features.ffill().bfill()
+features_bfill = features.bfill().ffill()
+for t in labels.index:
+    feo_val = labels.loc[t, 'FeO']
+    if pd.isna(feo_val): continue # 如果FeO值缺失，跳过这个时间点
+    
+    #窗口从 t-6小时 到 t-1小时 即0:00 - 5:00 对应 t = 6:00 的FeO含量
+    window_start = t - pd.Timedelta(hours=6)
+    window_end = t - pd.Timedelta(hours=1)
+    
+    # 获取窗口副本，避免 SettingWithCopyWarning
+    window = features.loc[window_start:window_end].copy()
+    
+    # 窗口长度检查（必须是4小时）
+    if len(window) < 4:   # 至少要有 4 个小时数据
+      continue
+
+    # 针对每一列进行阶梯填补
+    is_valid_window = True
+    
+    for col in window.columns:
+        num_missing = window[col].isnull().sum() 
+        
+        if num_missing >= 6:
+            is_valid_window = False
+            break
+        elif num_missing == 1:
+            # 1个缺失：取前后小时平均（线性插值）
+            nan_idx = window.index[window[col].isna()]
+            window.loc[nan_idx, col] = features_interpolated.loc[nan_idx, col]
+        elif num_missing == 2:
+            # 2个缺失：第一个前向，第二个后向
+            # 找到缺失位置
+            nan_idx = window.index[window[col].isna()]
+            window.loc[nan_idx[0], col] = features_ffill.loc[nan_idx[0], col]
+            window.loc[nan_idx[1], col] = features_bfill.loc[nan_idx[1], col]
+        elif num_missing in (3, 4, 5):
+            # 3~5个缺失：采用该特征全局均值进行填充
+            window[col] = window[col].fillna(global_means[col])
+        # num_missing == 0 则无需处理
+
+    if is_valid_window:
+        # 统一补齐到6行（前向/后向填充缺失的小时行），保证所有窗口形状一致
+        full_index = pd.date_range(window_start, window_end, freq='h')
+        if len(window) < 6:
+            window = window.reindex(full_index)
+            window = window.ffill().bfill()
+        # 将 window.values (6, 特征数) 加入列表
+        X_list.append(window.values)
+        y_list.append(feo_val)
+
+# 最后统一转换为 Numpy 数组，得到 (样本数, 6, 特征数)
+X = np.array(X_list)
+Y = np.array(y_list).reshape(-1, 1)
+
+print(f"处理完成！有效窗口数: {len(X_list)}")
+if len(X_list) > 0:
+    print(f"特征矩阵形状: {X.shape}") # 应该是 (N, 6, 特征数)
+
+# ===== 保存预处理结果，供温度曲线编码器使用 =====
+SAVE_DIR = "C:\\Users\\张宇轩\\Desktop\\Programs\\Code"
+features_interpolated.to_pickle(f"{SAVE_DIR}\\features_cleaned.pkl")
+labels.to_pickle(f"{SAVE_DIR}\\labels_cleaned.pkl")
+np.save(f"{SAVE_DIR}\\X_windows.npy", X)
+np.save(f"{SAVE_DIR}\\Y_labels.npy", Y)
+print(f"\n预处理结果已保存到 {SAVE_DIR}:")
+print(f"  features_cleaned.pkl — 清洗后完整特征 ({features_interpolated.shape})")
+print(f"  labels_cleaned.pkl   — FeO标签")
+print(f"  X_windows.npy        — 窗口化特征 ({X.shape})")
+print(f"  Y_labels.npy         — FeO标签数组 ({Y.shape})")
