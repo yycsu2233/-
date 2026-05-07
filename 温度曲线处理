@@ -1,0 +1,189 @@
+""
+根据双流注入的基于ATTENTION和1D-CNN的残差网络模型，经过我人手对温度特征尽心调整后最后发现，由于工业数据集
+的大部分缺失，只能采用注入温度来构建温度曲线，因此采取了
+#--------鼓干段--------
+    '鼓干段烟罩温度',
+    #--------预热段--------
+    '烟罩预热温度西1', '烟罩预热温度西2', '烟罩预热温度西3', '烟罩预热温度西4',
+    '烟罩预热温度西5', '烟罩预热温度西6', '烟罩预热温度西7',
+    '烟罩预热温度东1', '烟罩预热温度东2', '烟罩预热温度东3', '烟罩预热温度东4',
+    '烟罩预热温度东5', '烟罩预热温度东6', '烟罩预热温度东7',
+    #--------焙烧段--------
+    '焙烧烟罩温度1', '焙烧烟罩温度2', '焙烧烟罩温度3', '焙烧烟罩温度5',
+    #--------冷却段--------
+    '一冷段温度1', '一冷段温度2', '一冷段温度3',
+    '二冷段烟罩温度（左148）', '二冷段烟罩温度（右152）'
+这些特征作为局部温度特征进行卷积
+采用插值，最后补全30个测点进行卷积处理。
+剩下的1D-CNN与ATTENTION机制的搭建需要5/7晚上去做 模型架构图见附件/
+
+""
+import  numpy as np
+import pandas as pd
+import os
+import sys
+from scipy import interpolate
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+FEATURES_PATH = os.path.join(CODE_DIR, "features_cleaned.pkl")  # 清洗后的特征数据
+LABELS_PATH = os.path.join(CODE_DIR, "labels_cleaned.pkl")       # FeO标签数据
+X_WINDOWS_PATH = os.path.join(CODE_DIR, "X_windows.npy")        # 窗口化特征（numpy格式）
+Y_LABELS_PATH = os.path.join(CODE_DIR, "Y_labels.npy")          # FeO标签（numpy格式）
+# 读取 预处理后的数据
+def load_preprocessed_data():
+    features_df = pd.read_pickle(FEATURES_PATH)  # 读取特征数据
+    return features_df
+# 定义温度测点列表，构建温度曲线的位置
+TEMP_COLUMNS =[
+    #--------鼓干段--------
+    '鼓干段烟罩温度',
+    #--------预热段--------
+    '烟罩预热温度西1', '烟罩预热温度西2', '烟罩预热温度西3', '烟罩预热温度西4',
+    '烟罩预热温度西5', '烟罩预热温度西6', '烟罩预热温度西7',
+    '烟罩预热温度东1', '烟罩预热温度东2', '烟罩预热温度东3', '烟罩预热温度东4',
+    '烟罩预热温度东5', '烟罩预热温度东6', '烟罩预热温度东7',
+    #--------焙烧段--------
+    '焙烧烟罩温度1', '焙烧烟罩温度2', '焙烧烟罩温度3', '焙烧烟罩温度5',
+    #--------冷却段--------
+    '一冷段温度1', '一冷段温度2', '一冷段温度3',
+    '二冷段烟罩温度（左148）', '二冷段烟罩温度（右152）',
+]
+TEMP_POSITIONS = {
+    # ===== 鼓风干燥段 =====
+    # 位置 0.02：刚进料就开始鼓风干燥
+    '鼓干段烟罩温度':                      0.02,
+
+    # ===== 预热段（西侧7个） =====
+    # 位置从 0.04 到 0.46，均匀分布
+    # 数值越来越大 → 越靠近焙烧段，位置值越大
+    '烟罩预热温度西1':                      0.04,
+    '烟罩预热温度西2':                      0.10,
+    '烟罩预热温度西3':                      0.16,
+    '烟罩预热温度西4':                      0.22,
+    '烟罩预热温度西5':                      0.28,
+    '烟罩预热温度西6':                      0.34,
+    '烟罩预热温度西7':                      0.40,
+
+    # ===== 预热段（东侧7个） =====
+    # 和西侧对称，相同位置 → 插值时会取平均
+    '烟罩预热温度东1':                      0.04,
+    '烟罩预热温度东2':                      0.10,
+    '烟罩预热温度东3':                      0.16,
+    '烟罩预热温度东4':                      0.22,
+    '烟罩预热温度东5':                      0.28,
+    '烟罩预热温度东6':                      0.34,
+    '烟罩预热温度东7':                      0.40,
+
+    # ===== 焙烧段（核心工艺段） =====
+    # 最高温区，位置 0.55~0.68
+    '焙烧烟罩温度1':                        0.55,
+    '焙烧烟罩温度2':                        0.58,
+    '焙烧烟罩温度3':                        0.62,
+    '焙烧烟罩温度5':                        0.68,
+
+    # ===== 一冷段 =====
+    # 快速冷却区，位置 0.88~0.92
+    '一冷段温度1':                          0.88,   # 冷却入口（约1022°C）
+    '一冷段温度2':                          0.90,   # 冷却中段（约917°C）
+    '一冷段温度3':                          0.92,   # 冷却出口（约682°C）
+
+    # ===== 二冷段 =====
+    # 继续冷却，位置 0.93（左右两侧都在同一位置）
+    '二冷段烟罩温度（左148）':              0.93,   # 二冷左侧
+    '二冷段烟罩温度（右152）':              0.93,   # 二冷右侧}
+}
+# 3. 构建温度曲线
+def build_tem_curve(row,n_grid=30,kind='linear'):
+    # row 是DataFrame的一行，包含所有温度测点的值
+    raw_positions = []
+    raw_temps = []
+    used_columns = []
+    for col in TEMP_COLUMNS:
+        if col not in row or pd.isna(row[col]):
+            continue  # 跳过缺失的测点
+        val = row[col]
+        if pd.isna(val):
+            continue  # 跳过NaN值
+        pos = TEMP_POSITIONS.get(col,None)
+        if pos is None:
+            continue  # 跳过未定义位置的测点
+        raw_positions.append(pos)
+        raw_temps.append(val)
+        used_columns.append(col)
+    # 按位置排序
+    sorted_data = sorted(zip(raw_positions, raw_temps, used_columns), key=lambda x: x[0])
+    
+    # 解包：把排序后的元组拆回三个列表
+    raw_positions = [x[0] for x in sorted_data]   # 排序后的位置
+    raw_temps = [x[1] for x in sorted_data]       # 排序后的温度
+    used_columns = [x[2] for x in sorted_data]    # 排序后的列名
+    # 去东西重
+    n_raw_points = len(raw_temps)
+    dedup_positions = []    # 去重后的位置
+    dedup_temps = []        # 去重后的温度（重复位置取平均）
+    i = 0
+    while i < len(raw_positions):
+        # 找出所有和 raw_positions[i] 相同位置的索引
+        # 比如位置 0.93 出现了两次（左、右），那 j 就走到第2个之后
+        j = i
+        while j < len(raw_positions) and raw_positions[j] == raw_positions[i]:
+            j += 1
+        # raw_temps[i:j] 是同一位置的所有温度值
+        # np.mean() 取平均值作为这个位置的"代表温度"
+        dedup_positions.append(raw_positions[i])
+        dedup_temps.append(np.mean(raw_temps[i:j]))
+        i = j   # 跳到下一个不同位置
+
+    # 用去重后的数据替换原数据
+    raw_positions = dedup_positions
+    raw_temps = dedup_temps
+    #插值
+    grid_positions = np.linspace(0.02, 0.93, n_grid)
+
+    if len(raw_temps) < 2:
+        grid_temps = np.full(n_grid, np.nan)   # np.full 创建全为某个值的数组
+    else:
+        # interpolate.interp1d：一维插值函数
+        # 给定 (raw_positions, raw_temps) 这些散点
+        # 它就能算出来任意位置上的温度值
+        f_interp = interpolate.interp1d(
+            raw_positions,          # 已知点的位置（输入）
+            raw_temps,              # 已知点的温度（输出）
+            kind=kind,              # 插值方式：'linear' 或 'cubic'
+            bounds_error=False,     # 如果请求的位置超出测点范围 → 不报错
+            fill_value='extrapolate'  # 超出范围时 → 向外延伸（外推）
+        )
+        grid_temps = f_interp(grid_positions) 
+
+    return grid_positions, grid_temps, n_raw_points, len(raw_temps), used_columns
+# grid_positions是曲线横坐标，grid_temps是曲线纵坐标，n_raw_points是原始测点数量，len(raw_temps)是去重后的测点数量，used_columns是参与插值的测点列名列表
+def build_curves_batch(df, n_grid=30, kind='linear'):
+    
+    curves = []   # 创建一个空列表，用来存放所有曲线
+    
+    # df.index 是时间点索引（每行对应一个时间）
+    # 比如：2025-01-01 00:00, 2025-01-01 01:00, ...
+    for idx in df.index:
+        # df.loc[idx] 取出这一行的数据（通过索引标签）
+        # build_tem_curve 返回5个值，我们只需要第2个（grid_temps）
+        _, grid_temps, _, _, _ = build_tem_curve(df.loc[idx], n_grid, kind)
+        curves.append(grid_temps)   # 把这条曲线加到列表里
+    
+    # 把列表转成 numpy 数组（矩阵形式）
+    # np.array(curves) 的形状 = (时间点数, 30)
+    curve_matrix = np.array(curves)
+    
+    print(f"  温度曲线矩阵: {curve_matrix.shape}  "
+          f"({curve_matrix.shape[0]} 个时间点, {curve_matrix.shape[1]} 个格点)")
+    return curve_matrix
+
+
+def extract_global·_vars(df):
+
+    temp_cols_set = set(TEMP_COLUMNS)
+
+    proc_cols = [c for c in df.columns if c not in temp_cols_set]
+    proc_matrix = df[proc_cols].values
+    
+    return proc_matrix, proc_cols
+# 以上完成了温度曲线的构建和全局变量的提取，后续可以把它们拼在一起，作为模型的输入特征。
+# 搭建融合Attention机制的1D-CNN模型
